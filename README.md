@@ -1,6 +1,6 @@
 # Personal Assistant
 
-An agentic personal assistant powered by **Claude (claude-sonnet-4-6)** that lets you upload PDFs, chat with your knowledge base, attach images to questions, and get cited, streamed answers in real time.
+An agentic personal assistant that lets you upload PDFs, chat with your knowledge base, attach images to questions, and get cited, streamed answers in real time.
 
 ---
 
