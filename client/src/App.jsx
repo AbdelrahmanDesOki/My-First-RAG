@@ -351,7 +351,6 @@ function App() {
 
         <div className="sidebarFooter">
           <span className="ragBadge">RAG mode</span>
-          <span className="ragBadgeHint">Powered by Claude</span>
         </div>
       </aside>
 
