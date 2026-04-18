@@ -1,6 +1,6 @@
 import { ChatAnthropic } from "@langchain/anthropic";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { searchKnowledgeBase } from "./tools.js";
+import { rawSearch } from "./tools.js";
 
 // Lazy singleton — created on first call so dotenv has already run
 let model;
@@ -14,45 +14,85 @@ const getModel = () => {
   return model;
 };
 
-const SYSTEM_PROMPT = `You are a document assistant. You answer questions strictly based on the document context provided to you.
+const SYSTEM_PROMPT = `You are a document assistant. Answer questions strictly based on the document context provided.
 
-Rules you must follow:
+Rules:
 1. Answer ONLY using information found in the provided context.
 2. If the context does not contain a clear answer, respond with: "I don't have enough information in the provided documents to answer this question."
 3. Do not use your general knowledge or make assumptions beyond what the context states.
 4. Be concise, clear, and accurate.
-5. If the context partially answers the question, share what you found and note what is missing.`;
+5. If an image is provided, analyze it and relate it to the document context where relevant.`;
 
-export async function runAgent({
-  sessionId = "default",
-  message,
-  mode = "rag",
-}) {
-  console.log(`[agent] RAG query — sessionId: ${sessionId}`);
+// Async generator — yields SSE-ready events for streaming
+export async function* streamAgent({ sessionId = "default", message, imageData, mode = "rag" }) {
+  console.log(`[agent] RAG stream — sessionId: ${sessionId}`);
 
-  try {
-    // Step 1: Retrieve relevant chunks from Pinecone
-    console.log(`🔍 Searching knowledge base for: "${message}"`);
-    const context = await searchKnowledgeBase.invoke({ query: message });
+  // Step 1: Retrieve relevant chunks from Pinecone (with metadata for citations)
+  const results = await rawSearch(message);
 
-    // Step 2: Send context + question to Claude in a single call
-    const response = await getModel().invoke([
-      new SystemMessage(SYSTEM_PROMPT),
-      new HumanMessage(
-        `Here is the relevant context retrieved from the documents:\n\n${context}\n\n---\n\nQuestion: ${message}`,
-      ),
-    ]);
+  // Build citations from document metadata
+  const citations = results.map((doc, i) => ({
+    id: i + 1,
+    source: doc.metadata?.source
+      ? doc.metadata.source.split("/").pop()   // just the filename
+      : "Document",
+    page: doc.metadata?.loc?.pageNumber ?? doc.metadata?.page ?? null,
+    snippet: doc.pageContent.slice(0, 180).trim() + "…",
+  }));
 
-    const output =
-      typeof response.content === "string"
-        ? response.content
-        : response.content.map((c) => c.text ?? "").join("");
+  // Build numbered context string so Claude can reference sources
+  const context =
+    results.length > 0
+      ? results.map((doc, i) => `[${i + 1}] ${doc.pageContent}`).join("\n\n---\n\n")
+      : "No relevant documents found.";
 
-    console.log(`✅ Response: ${output.slice(0, 100)}...`);
+  // Step 2: Build message content — text always, image optional
+  const userContent = [];
 
-    return { output, mode };
-  } catch (error) {
-    console.error("❌ Error in runAgent:", error);
-    throw error;
+  if (imageData) {
+    // Parse "data:<mediaType>;base64,<data>" and normalise the media type
+    const match = imageData.match(/^data:([^;]+);base64,(.+)$/s);
+    if (match) {
+      let mediaType = match[1].toLowerCase().trim();
+      const base64Data = match[2];
+
+      // Normalise non-standard aliases → Anthropic-accepted types
+      if (mediaType === "image/jpg") mediaType = "image/jpeg";
+
+      const VALID = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+      if (VALID.includes(mediaType)) {
+        userContent.push({
+          type: "image_url",
+          image_url: { url: `data:${mediaType};base64,${base64Data}` },
+        });
+      } else {
+        console.warn(`[agent] Unsupported image type "${mediaType}" — skipping image`);
+      }
+    }
   }
+
+  userContent.push({
+    type: "text",
+    text: `Context from documents:\n\n${context}\n\n---\n\nQuestion: ${message}`,
+  });
+
+  // Step 3: Stream the response from Claude
+  const stream = await getModel().stream([
+    new SystemMessage(SYSTEM_PROMPT),
+    new HumanMessage({ content: userContent }),
+  ]);
+
+  for await (const chunk of stream) {
+    const text =
+      typeof chunk.content === "string"
+        ? chunk.content
+        : Array.isArray(chunk.content)
+        ? chunk.content.map((c) => (typeof c === "string" ? c : (c?.text ?? ""))).join("")
+        : "";
+
+    if (text) yield { type: "chunk", text };
+  }
+
+  // Step 4: Send citations as the final event
+  yield { type: "citations", data: citations };
 }

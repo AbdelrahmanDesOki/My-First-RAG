@@ -13,24 +13,26 @@ if (typeof AbortSignal.any !== "function") {
       signal.addEventListener(
         "abort",
         () => controller.abort(signal.reason),
-        { once: true },
+        { once: true }
       );
     }
     return controller.signal;
   };
 }
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import os from "node:os";
 import path from "node:path";
 import { unlink } from "node:fs/promises";
-import { runAgent } from "./agent.js";
+import { streamAgent } from "./agent.js";
 import { ingestData } from "./ingest.js";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Increase limit to 20 MB to support base64-encoded image payloads
+app.use(express.json({ limit: "20mb" }));
 
 // Multer for PDF uploads
 const upload = multer({
@@ -50,27 +52,62 @@ const upload = multer({
   limits: { fileSize: 25 * 1024 * 1024 },
 });
 
-// Chat endpoint
+// Chat endpoint — streams response as Server-Sent Events (SSE)
 app.post("/api/chat", async (req, res) => {
+  const { message, sessionId, mode = "rag", imageData } = req.body;
+
+  if (!message) return res.status(400).json({ error: "Message required" });
+
+  // Set SSE headers (cors middleware has already set CORS headers via setHeader)
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+
   try {
-    const { message, sessionId, mode = "rag" } = req.body;
-    if (!message) return res.status(400).json({ error: "Message required" });
+    for await (const event of streamAgent({ message, sessionId, mode, imageData })) {
+      if (res.writableEnded) break;
+      send(event);
+    }
+  } catch (err) {
+    console.error("❌ Stream error:", err);
+    if (!res.writableEnded) {
+      send({ type: "error", message: err.message });
+    }
+  } finally {
+    if (!res.writableEnded) {
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  }
+});
 
-    const answer = await runAgent({ message, sessionId, mode });
+// Clear all vectors from Pinecone (reset knowledge base)
+app.delete("/api/clear", async (_req, res) => {
+  try {
+    const { Pinecone } = await import("@pinecone-database/pinecone");
+    const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
+    const index = pc.Index(process.env.PINECONE_INDEX);
 
-    const output = answer?.output || answer?.text || "";
+    // Discover all namespaces then delete each one
+    const stats = await index.describeIndexStats();
+    const namespaces = Object.keys(stats.namespaces ?? {});
 
-    if (!output || output.trim() === "") {
-      return res.json({
-        answer:
-          "I apologize, but I couldn't generate a proper response. Could you please rephrase your question?",
-        mode: answer?.mode ?? mode,
-      });
+    if (namespaces.length === 0) {
+      // Index already empty — still try default namespace just in case
+      await index.namespace("").deleteAll().catch(() => {});
+    } else {
+      for (const ns of namespaces) {
+        await index.namespace(ns).deleteAll();
+        console.log(`🗑️  Cleared namespace: "${ns || "(default)"}"`);
+      }
     }
 
-    res.json({ answer: output, mode: answer?.mode ?? mode });
+    console.log("✅ Knowledge base cleared");
+    res.json({ ok: true });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Clear error:", err);
     res.status(500).json({ error: err.message });
   }
 });
